@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+
+# Virtual envs
+.venv/
+venv/
+ENV/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Logs and cache
+*.log
+.cache/
+
+# Editor/IDE
+.idea/
+.vscode/
+
+# OpenCV screenshots/outputs
+screenshot_*.png
+
+# OS/backup files
+*~
+*.swp
+*.swo
+
