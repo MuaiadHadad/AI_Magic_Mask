@@ -63,6 +63,13 @@ except Exception:
     MP_AVAILABLE = False
 
 
+# Global performance knobs
+try:
+    cv2.setUseOptimized(True)
+    cv2.setNumThreads(4)
+except Exception:
+    pass
+
 @dataclass
 class AppConfig:
     title: str = "AI Magic Mask"
@@ -77,6 +84,10 @@ class AppConfig:
     mp_min_tracking_confidence: float = 0.5
     # Anonymization mode: 'off' | 'blur' | 'pixel' | 'solid'
     anonymize: str = 'off'
+    # Performance tuning
+    detect_scale: float = 0.6           # downscale frame for detection for speed
+    detect_every_n: int = 2             # run detection every N frames; track in-between
+    roi_margin_frac: float = 0.25       # expand last face bbox for ROI detection
 
 
 # Utility: merge rectangles with simple NMS (by IoU)
@@ -113,18 +124,52 @@ def _merge_rects(rects: list[tuple[int, int, int, int]], iou_thresh: float = 0.3
     return merged
 
 # ----------------------------- OpenCV-only mode -----------------------------
-def _detect_faces_haar_cv(frame_bgr: np.ndarray, detector: cv2.CascadeClassifier, detector_profile: Optional[cv2.CascadeClassifier] = None) -> list[tuple[int, int, int, int]]:
+# Track last faces for ROI detection
+_last_faces_cv: list[tuple[int, int, int, int]] = []
+
+
+def _detect_faces_haar_cv(frame_bgr: np.ndarray, detector: cv2.CascadeClassifier, detector_profile: Optional[cv2.CascadeClassifier] = None,
+                          use_roi: bool = True, roi_margin_frac: float = 0.25) -> list[tuple[int, int, int, int]]:
+    global _last_faces_cv
+    h_img, w_img = frame_bgr.shape[:2]
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    faces_np = detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(48, 48))
-    faces_list: list[tuple[int, int, int, int]] = []
-    if faces_np is not None:
-        for f in list(faces_np):
-            try:
-                x, y, w, h = int(f[0]), int(f[1]), int(f[2]), int(f[3])
-                faces_list.append((x, y, w, h))
-            except Exception:
-                pass
-    # Profile detection (left profile)
+    rects_all: list[tuple[int, int, int, int]] = []
+
+    def detect_in_region(g: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> list[tuple[int, int, int, int]]:
+        sub = g[y0:y1, x0:x1]
+        res = detector.detectMultiScale(sub, scaleFactor=1.1, minNeighbors=5, minSize=(48, 48))
+        out: list[tuple[int, int, int, int]] = []
+        if res is not None:
+            for f in list(res):
+                try:
+                    x, y, w, h = int(f[0]), int(f[1]), int(f[2]), int(f[3])
+                    out.append((x + x0, y + y0, w, h))
+                except Exception:
+                    pass
+        return out
+
+    if use_roi and _last_faces_cv:
+        # Detect within expanded ROIs to save time
+        for (x, y, w, h) in _last_faces_cv:
+            mx = int(w * roi_margin_frac)
+            my = int(h * roi_margin_frac)
+            rx0 = max(0, x - mx)
+            ry0 = max(0, y - my)
+            rx1 = min(w_img, x + w + mx)
+            ry1 = min(h_img, y + h + my)
+            rects_all.extend(detect_in_region(gray, rx0, ry0, rx1, ry1))
+    else:
+        # Full-frame if no prior faces
+        faces_np = detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(48, 48))
+        if faces_np is not None:
+            for f in list(faces_np):
+                try:
+                    x, y, w, h = int(f[0]), int(f[1]), int(f[2]), int(f[3])
+                    rects_all.append((x, y, w, h))
+                except Exception:
+                    pass
+
+    # Profile detection on full gray (quick pass)
     prof_list: list[tuple[int, int, int, int]] = []
     if detector_profile is not None:
         prof_np = detector_profile.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(48, 48))
@@ -135,7 +180,6 @@ def _detect_faces_haar_cv(frame_bgr: np.ndarray, detector: cv2.CascadeClassifier
                     prof_list.append((x, y, w, h))
                 except Exception:
                     pass
-        # Right profile by flipping horizontally
         gray_flip = cv2.flip(gray, 1)
         prof_np_flip = detector_profile.detectMultiScale(gray_flip, scaleFactor=1.1, minNeighbors=5, minSize=(48, 48))
         if prof_np_flip is not None:
@@ -143,18 +187,19 @@ def _detect_faces_haar_cv(frame_bgr: np.ndarray, detector: cv2.CascadeClassifier
             for f in list(prof_np_flip):
                 try:
                     x, y, w, h = int(f[0]), int(f[1]), int(f[2]), int(f[3])
-                    # Map back from flipped coords
                     x_unflip = fw - (x + w)
                     prof_list.append((x_unflip, y, w, h))
                 except Exception:
                     pass
-    all_rects = faces_list + prof_list
-    return _merge_rects(all_rects, iou_thresh=0.35)
+
+    all_rects = rects_all + prof_list
+    merged = _merge_rects(all_rects, iou_thresh=0.35)
+    _last_faces_cv = merged
+    return merged
 
 
-def _detect_faces_mediapipe_cv(frame_bgr: np.ndarray, mp_face_mesh) -> tuple[list[tuple[int, int, int, int]], list[np.ndarray]]:
+def _detect_faces_mediapipe_cv(frame_bgr: np.ndarray, mp_face_mesh, scale: float = 0.6) -> tuple[list[tuple[int, int, int, int]], list[np.ndarray]]:
     h0, w0 = frame_bgr.shape[:2]
-    scale = 0.7
     small_frame = cv2.resize(frame_bgr, (int(w0 * scale), int(h0 * scale)))
     rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
     results = mp_face_mesh.process(rgb_small)
@@ -336,16 +381,24 @@ def run_cv2_main(source: str, res: str, backend: str, cfg: AppConfig, max_frames
     fps_hist: list[float] = []
     last_ts = time.perf_counter()
     frame_counter = 0
-
     while True:
         ok, frame = cap.read()
         if not ok or frame is None:
             time.sleep(0.01)
             continue
-        if mp_face_mesh is not None:
-            faces, landmarks_list = _detect_faces_mediapipe_cv(frame, mp_face_mesh)
+        faces: list[tuple[int, int, int, int]]
+        landmarks_list: list[np.ndarray]
+        if backend.lower() == "mediapipe" and mp_face_mesh is not None:
+            # Decimate detection frequency
+            if frame_counter % max(1, cfg.detect_every_n) == 0:
+                faces, landmarks_list = _detect_faces_mediapipe_cv(frame, mp_face_mesh, scale=cfg.detect_scale)
+            else:
+                faces, landmarks_list = _last_faces_cv, []
         else:
-            faces = _detect_faces_haar_cv(frame, detector, detector_profile)
+            if frame_counter % max(1, cfg.detect_every_n) == 0:
+                faces = _detect_faces_haar_cv(frame, detector, detector_profile, use_roi=True, roi_margin_frac=cfg.roi_margin_frac)
+            else:
+                faces = _last_faces_cv
             landmarks_list = []
         out = _render_overlays_cv(frame, faces, landmarks_list, anonymize_mode=cfg.anonymize)
 
@@ -609,6 +662,8 @@ class MagicMaskApp:
     def _loop(self) -> None:
         self.fps_hist.clear()
         last_ts = time.perf_counter()
+        frame_counter = 0
+        last_faces_gui: list[tuple[int, int, int, int]] = []
         while self.running:
             ok, frame = self.cap.read() if self.cap else (False, None)
             if not ok or frame is None:
@@ -618,10 +673,20 @@ class MagicMaskApp:
             backend = self.backend_var.get()
             faces, landmarks_list = ([], [])
             if backend == "MediaPipe" and MP_AVAILABLE and self.mp_face_mesh is not None:
-                faces, landmarks_list = self._detect_faces_mediapipe(frame)
+                if frame_counter % max(1, self.cfg.detect_every_n) == 0:
+                    # Downscale mediapipe for speed
+                    faces, landmarks_list = self._detect_faces_mediapipe_scaled(frame, scale=self.cfg.detect_scale)
+                    last_faces_gui = faces
+                else:
+                    faces = last_faces_gui
+                    landmarks_list = []
             else:
-                faces = self._detect_faces_haar(frame)
-                landmarks_list = []
+                if frame_counter % max(1, self.cfg.detect_every_n) == 0:
+                    faces = self._detect_faces_haar_roi(frame, roi_margin_frac=self.cfg.roi_margin_frac)
+                    last_faces_gui = faces
+                else:
+                    faces = last_faces_gui
+                    landmarks_list = []
 
             out = self._render_overlays(frame, faces, landmarks_list)
             self.frame_bgr = out
